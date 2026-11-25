@@ -1,8 +1,10 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-import base64
 import hashlib
+import io
+import fitz  # PyMuPDF សម្រាប់បង្ហាញទំព័រ PDF លើគ្រប់ Browser និងទូរស័ព្ទ
+import docx  # សម្រាប់បង្ហាញអត្ថបទពីឯកសារ Word (.docx)
 from datetime import datetime
 from streamlit_quill import st_quill
 
@@ -53,7 +55,6 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS portfolio_submissions 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, class_name TEXT, student_id TEXT, student_name TEXT, file_name TEXT, file_data BLOB, note TEXT, score TEXT, date TEXT)''')
 
-    # អាប់ដេតជួរឈរសម្រាប់តារាងចាស់ៗ
     for tbl in ['attendance', 'lessons', 'quizzes', 'scores']:
         c.execute(f"PRAGMA table_info({tbl})")
         cols = [col[1] for col in c.fetchall()]
@@ -114,7 +115,73 @@ def get_setting(key, default_val):
     res = c.fetchone()
     return res[0] if res else default_val
 
-# រចនាម៉ូដ CSS ផ្ទៃខាងក្រោយពណ៌ស និងរចនាបថ Moodle / PLP LMS
+# អនុគមន៍គណនាវឌ្ឍនភាពសិក្សារបស់សិស្ស (Progress Calculation)
+def calculate_student_progress(stu_id, week=None):
+    c.execute("SELECT activity_key FROM completions WHERE student_id = ?", (stu_id,))
+    done_set = {r[0] for r in c.fetchall()}
+    
+    target_weeks = [week] if week else WEEKS
+    total_items = 0
+    done_items = 0
+    
+    for w in target_weeks:
+        # ក្នុង ១ សប្តាហ៍មានសកម្មភាពគោល ៣ (វត្តមាន, វេទិកាពិភាក្សា, តេស្ត) + ចំនួន Learning Materials
+        base_keys = [f"att_{w}", f"forum_{w}", f"quiz_{w}"]
+        c.execute("SELECT id FROM lessons WHERE week = ? AND category != 'សេចក្តីផ្តើម'", (w,))
+        mat_keys = [f"lesson_{r[0]}" for r in c.fetchall()]
+        
+        all_w_keys = base_keys + mat_keys
+        total_items += len(all_w_keys)
+        done_items += sum(1 for k in all_w_keys if k in done_set)
+        
+    percent = int((done_items / total_items) * 100) if total_items > 0 else 0
+    return done_items, total_items, percent
+
+# អនុគមន៍បង្ហាញឯកសារអានផ្ទាល់លើអេក្រង់ (គាំទ្រ PDF, Word, រូបភាព លើគ្រប់ទូរស័ព្ទ និងកុំព្យូទ័រ)
+def render_document_viewer(file_bytes, file_name, unique_key):
+    if not file_bytes or not file_name:
+        return
+    
+    # ប៊ូតុងទាញយកឯកសារ (Download)
+    st.download_button(
+        label=f"📥 ទាញយកឯកសារទុកអាន ({file_name})",
+        data=file_bytes,
+        file_name=file_name,
+        key=f"dl_{unique_key}",
+        type="primary"
+    )
+    
+    fname_lower = file_name.lower()
+    # ១. បើជាឯកសារ PDF -> បំប្លែងទំព័រនីមួយៗជារូបភាពបង្ហាញផ្ទាល់លើអេក្រង់
+    if fname_lower.endswith(".pdf"):
+        with st.expander("📖 ចុចទីនេះដើម្បីបើកអានឯកសារ PDF ផ្ទាល់លើអេក្រង់", expanded=True):
+            try:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                total_pages = len(doc)
+                st.caption(f"ឯកសារនេះមានចំនួន {total_pages} ទំព័រ (អូសចុះក្រោមដើម្បីអានបន្ត)")
+                for page_num in range(total_pages):
+                    page = doc.load_page(page_num)
+                    pix = page.get_pixmap(dpi=150)
+                    img_bytes = pix.tobytes("png")
+                    st.image(img_bytes, caption=f"ទំព័រទី {page_num + 1} / {total_pages}", use_container_width=True)
+            except Exception as e:
+                st.error(f"មិនអាចបើកបង្ហាញទំព័រ PDF ផ្ទាល់បានទេ សូមចុចប៊ូតុងទាញយកខាងលើ។ ({e})")
+                
+    # ២. បើជាឯកសារ Word (.docx) -> បង្ហាញអត្ថបទផ្ទាល់លើអេក្រង់
+    elif fname_lower.endswith(".docx"):
+        with st.expander("📖 ចុចទីនេះដើម្បីបើកអានឯកសារ Word ផ្ទាល់លើអេក្រង់", expanded=True):
+            try:
+                doc = docx.Document(io.BytesIO(file_bytes))
+                full_text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                st.markdown(full_text)
+            except Exception as e:
+                st.info("សូមចុចប៊ូតុងទាញយកខាងលើដើម្បីបើកឯកសារ Word នេះ។")
+                
+    # ៣. បើជារូបភាព (.png, .jpg, .jpeg) -> បង្ហាញរូបភាពផ្ទាល់
+    elif fname_lower.endswith((".png", ".jpg", ".jpeg")):
+        st.image(file_bytes, caption=file_name, use_container_width=True)
+
+# រចនាម៉ូដ CSS
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Battambang:wght@400;700&display=swap');
@@ -141,30 +208,23 @@ st.markdown("""
         margin: 0;
     }
     .login-card {
-        border: 1px solid #dbeafe;
-        border-top: 5px solid #2563eb;
-        border-radius: 12px;
-        padding: 25px;
-        background-color: #f8fafc;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+        border: 1px solid #dbeafe; border-top: 5px solid #2563eb; border-radius: 12px;
+        padding: 25px; background-color: #f8fafc; box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+    }
+    .progress-card {
+        background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px;
+        padding: 12px 18px; margin-bottom: 15px;
     }
     .welcome-banner {
-        border: 1px solid #dbeafe;
-        border-top: 4px solid #2563eb;
-        border-radius: 10px;
-        padding: 20px;
-        text-align: center;
-        background-color: #ffffff;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
-        margin-bottom: 20px;
+        border: 1px solid #dbeafe; border-top: 4px solid #2563eb; border-radius: 10px;
+        padding: 20px; text-align: center; background-color: #ffffff;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04); margin-bottom: 20px;
     }
     .welcome-banner h3 { color: #1f2937; margin-bottom: 8px; font-weight: bold; }
     .welcome-banner p { color: #4b5563; font-size: 16px; margin: 0; }
     .welcome-banner span { color: #2563eb; font-weight: bold; }
 
-    .info-card {
-        border-radius: 10px; padding: 15px; display: flex; align-items: center; margin-bottom: 15px;
-    }
+    .info-card { border-radius: 10px; padding: 15px; display: flex; align-items: center; margin-bottom: 15px; }
     .card-green { background-color: #f0fdf4; border: 1px solid #bbf7d0; }
     .card-blue { background-color: #eff6ff; border: 1px solid #bfdbfe; }
     .card-pink { background-color: #fdf2f8; border: 1px solid #fbcfe8; }
@@ -199,22 +259,16 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ក្បាលខាងលើពណ៌ស
-st.markdown('''
-    <div class="lms-header">
-        <p class="lms-main-title">📐 ចំណេះដឹងគណិតវិទ្យា 🎓</p>
-    </div>
-''', unsafe_allow_html=True)
+st.markdown('<div class="lms-header"><p class="lms-main-title">📐 ចំណេះដឹងគណិតវិទ្យា 🎓</p></div>', unsafe_allow_html=True)
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.user_info = {}
 
 # ==============================================================================
-# អនុគមន៍រួម៖ បង្ហាញបញ្ជី Learning Materials ក្នុងសប្តាហ៍នីមួយៗ (ប្រើបានទាំងសិស្ស និងគ្រូ)
+# អនុគមន៍រួម៖ បង្ហាញបញ្ជី Learning Materials ក្នុងសប្តាហ៍នីមួយៗ
 # ==============================================================================
 def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_keys=set()):
-    # ១. សេចក្តីផ្តើម / សេចក្តីណែនាំប្រចាំសប្តាហ៍
     c.execute("SELECT id, title, content, pdf_name, pdf_data FROM lessons WHERE week = ? AND category = 'សេចក្តីផ្តើម' ORDER BY id ASC", (selected_week,))
     for i_id, title, content, pdf_name, pdf_data in c.fetchall():
         col_i1, col_i2 = st.columns([8, 1]) if is_teacher else (st.container(), None)
@@ -222,14 +276,13 @@ def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_
             st.markdown(f'<div class="welcome-banner" style="text-align:left; padding:12px 18px;"><h4 style="color:#1d4ed8; margin:0;">📌 {title}</h4></div>', unsafe_allow_html=True)
             st.markdown(content, unsafe_allow_html=True)
             if pdf_data and pdf_name:
-                st.download_button(f"📥 ទាញយកឯកសារណែនាំ៖ {pdf_name}", data=pdf_data, file_name=pdf_name, key=f"intro_dl_{i_id}_{is_teacher}")
+                render_document_viewer(pdf_data, pdf_name, f"intro_{i_id}_{is_teacher}")
         if is_teacher and col_i2:
             if col_i2.button("🗑️ លុប", key=f"del_intro_{i_id}"):
                 c.execute("DELETE FROM lessons WHERE id = ?", (i_id,))
                 conn.commit()
                 st.rerun()
 
-    # ២. បញ្ជី Learning Materials ទាំងអស់ក្នុងសប្តាហ៍នេះ (File, Video, Interactive H5P, Link, Page, Task)
     c.execute('''SELECT id, category, title, content, video_url, pdf_name, pdf_data, v_question, v_opt_a, v_opt_b, v_opt_c, v_correct, ext_link, video_blob, video_filename 
                  FROM lessons WHERE week = ? AND category != 'សេចក្តីផ្តើម' ORDER BY id ASC''', (selected_week,))
     materials = c.fetchall()
@@ -241,7 +294,6 @@ def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_
         act_key = f"lesson_{act_id}"
         is_done = act_key in completed_keys
 
-        # កំណត់ Icon និងស្លាកសម្គាល់តាមប្រភេទ Material
         if cat == "ឯកសារអាន (File)":
             icon_cls, icon_char, action_label = "icon-pdf", "📄", "ឯកសារអាន (File)"
         elif cat == "វីដេអូបង្រៀន (Video)":
@@ -258,7 +310,7 @@ def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_
         if is_teacher:
             status_html = f'<div class="act-status-pending">ប្រភេទ៖ {action_label}</div>'
         else:
-            status_html = f'<div class="act-status-done">✓ រួចរាល់ ({action_label})</div>' if is_done else f'<div class="act-status-pending">○ {action_label}</div>'
+            status_html = f'<div class="act-status-done">✓ បានរៀនរួចរាល់ ({action_label})</div>' if is_done else f'<div class="act-status-pending">○ មិនទាន់បានបញ្ចប់ ({action_label})</div>'
 
         col_m1, col_m2 = st.columns([9, 1]) if is_teacher else (st.container(), None)
         with col_m1:
@@ -278,29 +330,22 @@ def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_
                 conn.commit()
                 st.rerun()
 
-        with st.expander(f"បើកមើល៖ {title}"):
+        with st.expander(f"បើកអាន / ទស្សនា៖ {title}"):
             if content:
                 st.markdown(content, unsafe_allow_html=True)
             
-            # បង្ហាញឯកសារ File (PDF, Word, Excel, Slide...)
+            # បង្ហាញឯកសារអានផ្ទាល់លើអេក្រង់ + ប៊ូតុង Download
             if pdf_data and pdf_name:
-                st.download_button(f"📥 ទាញយកឯកសារ៖ {pdf_name}", data=pdf_data, file_name=pdf_name, key=f"dl_m_{act_id}_{is_teacher}")
-                if pdf_name.lower().endswith(".pdf"):
-                    with st.expander("👁️ អានឯកសារ PDF ផ្ទាល់លើអេក្រង់"):
-                        base64_pdf = base64.b64encode(pdf_data).decode('utf-8')
-                        st.markdown(f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500" type="application/pdf"></iframe>', unsafe_allow_html=True)
+                render_document_viewer(pdf_data, pdf_name, f"mat_{act_id}_{is_teacher}")
             
-            # បង្ហាញវីដេអូ YouTube ឬ វីដេអូ Upload MP4
             if video_url:
                 st.video(video_url)
             if vid_blob:
                 st.video(vid_blob)
 
-            # បង្ហាញតំណភ្ជាប់ Link ខាងក្រៅ
             if ext_link:
                 st.link_button("🌐 ចុចទីនេះដើម្បីបើកតំណភ្ជាប់សិក្សា", ext_link)
 
-            # បង្ហាញសំណួរអន្តរកម្ម H5P
             if v_q and v_a and v_b and v_c:
                 st.markdown("---")
                 st.markdown(f"**🎬 សំណួរបំផុសគំនិត៖** {v_q}")
@@ -315,12 +360,16 @@ def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_
                     else:
                         st.error(f"❌ មិនទាន់ត្រូវទេ! ចម្លើយត្រូវគឺ៖ {v_corr}")
 
-            # ប៊ូតុងគូសចំណាំថារួចរាល់សម្រាប់សិស្ស
-            if not is_teacher and not is_done:
-                if st.button("✓ គូសចំណាំថារួចរាល់", key=f"dn_b_{act_id}"):
-                    c.execute("INSERT INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (stu_id, act_key, datetime.now().strftime("%Y-%m-%d %H:%M")))
-                    conn.commit()
-                    st.rerun()
+            # ប៊ូតុងគូសចំណាំថារៀនរួចរាល់ ដើម្បីដំឡើងភាគរយវឌ្ឍនភាព
+            if not is_teacher:
+                st.markdown("---")
+                if not is_done:
+                    if st.button("✅ គូសចំណាំថាបានអាន/រៀនមេរៀននេះរួចរាល់ (បង្កើនវឌ្ឍនភាព)", key=f"dn_b_{act_id}", type="primary"):
+                        c.execute("INSERT INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (stu_id, act_key, datetime.now().strftime("%Y-%m-%d %H:%M")))
+                        conn.commit()
+                        st.rerun()
+                else:
+                    st.success("✓ អ្នកបានបញ្ចប់មេរៀននេះរួចរាល់ហើយ!")
 
 
 # ==============================================================================
@@ -399,6 +448,12 @@ else:
             st.success(f"**តួនាទី៖ គ្រូបង្រៀន**\n\nឈ្មោះ៖ {user['full_name']}\n\nEmail៖ {user['email']}")
         else:
             st.info(f"**តួនាទី៖ សិស្ស**\n\nឈ្មោះ៖ {user['full_name']}\n\nអត្តលេខ៖ {user['student_id']} ({user['class_name']})\n\nEmail៖ {user['email']}")
+            # បង្ហាញវឌ្ឍនភាពសរុបនៅរបារខាងឆ្វេងផងដែរ
+            d_all, t_all, pct_all = calculate_student_progress(user["student_id"])
+            st.markdown(f"**📈 វឌ្ឍនភាពសិក្សាសរុប៖ {pct_all}%**")
+            st.progress(pct_all / 100)
+            st.caption(f"បានបំពេញ {d_all} លើ {t_all} សកម្មភាព")
+
         if st.button("🚪 ចាកចេញ (Sign Out)", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.user_info = {}
@@ -419,6 +474,15 @@ else:
                 st.session_state.user_info = {}
                 st.rerun()
 
+        # បង្ហាញផ្ទាំងវឌ្ឍនភាពសិក្សាសរុប (Overall Progress Bar) នៅផ្នែកខាងលើ
+        d_all, t_all, pct_all = calculate_student_progress(stu_id)
+        st.markdown(f'''
+            <div class="progress-card">
+                <strong>📊 វឌ្ឍនភាពនៃការសិក្សាសរុបរបស់អ្នក (Course Completion)៖ {pct_all}%</strong> ({d_all} / {t_all} សកម្មភាព)
+            </div>
+        ''', unsafe_allow_html=True)
+        st.progress(pct_all / 100)
+
         top_menu = st.radio("ម៉ឺនុយ៖", ["📘 វគ្គសិក្សា", "👥 អ្នកចូលរួម", "📊 ពិន្ទុរបស់ខ្ញុំ", "🏛️ បណ្ណាល័យ", "📝 បុរេតេស្ត & តេស្តបញ្ចប់"], horizontal=True, label_visibility="collapsed")
         st.markdown("<hr style='margin-top: 5px; margin-bottom: 15px;'>", unsafe_allow_html=True)
 
@@ -437,14 +501,14 @@ else:
                         st.info(f"**[{ndate}]** {msg}")
 
             st.write("")
-            with st.expander("⌄ ទូទៅ", expanded=True):
+            with st.expander("⌄ ទូទៅ", expanded=False):
                 st.markdown(f'<div class="welcome-banner"><h3>សូមជម្រាបសួរ {stu_name}!</h3><p>សូមស្វាគមន៍មកកាន់វគ្គសិក្សាស្តីពី <span>ចំណេះដឹងគណិតវិទ្យា</span> 🫶</p></div>', unsafe_allow_html=True)
                 kc1, kc2, kc3 = st.columns(3)
                 with kc1: st.markdown(f'<div class="info-card card-green"><div class="card-icon">⏱️</div><div><p class="card-title">{get_setting("card1_title", "រយៈពេលសិក្សា")}</p><p class="card-desc">{get_setting("card1_desc", "៥ សប្តាហ៍")}</p></div></div>', unsafe_allow_html=True)
                 with kc2: st.markdown(f'<div class="info-card card-blue"><div class="card-icon">👥</div><div><p class="card-title">{get_setting("card2_title", "ទម្រង់សិក្សា")}</p><p class="card-desc">{get_setting("card2_desc", "ស្វ័យសិក្សា និងអនឡាញ")}</p></div></div>', unsafe_allow_html=True)
                 with kc3: st.markdown(f'<div class="info-card card-pink"><div class="card-icon">💻</div><div><p class="card-title">{get_setting("card3_title", "ការវាយតម្លៃ & ផលបត្រ")}</p><p class="card-desc">{get_setting("card3_desc", "តេស្ត និងប្រគល់ផលបត្រ")}</p></div></div>', unsafe_allow_html=True)
 
-            with st.expander("⌄ ផលបត្រ និងការប្រគល់កិច្ចការ (Portfolio) 🗂️", expanded=True):
+            with st.expander("⌄ ផលបត្រ និងការប្រគល់កិច្ចការ (Portfolio) 🗂️", expanded=False):
                 c.execute("SELECT id, title, description, due_date FROM portfolio_tasks ORDER BY id ASC")
                 p_tasks = c.fetchall()
                 c.execute("SELECT task_id FROM portfolio_submissions WHERE student_id = ?", (stu_id,))
@@ -470,6 +534,12 @@ else:
             with st.expander("⌄ មេរៀន និងសកម្មភាពសិក្សាប្រចាំសប្តាហ៍ (សប្តាហ៍ទី ១ - ៥) 📚", expanded=True):
                 selected_week = st.selectbox("🔽 ជ្រើសរើសសប្តាហ៍សិក្សា៖", WEEKS)
                 
+                # បង្ហាញវឌ្ឍនភាពប្រចាំសប្តាហ៍នេះ
+                d_w, t_w, pct_w = calculate_student_progress(stu_id, selected_week)
+                st.write(f"**📈 វឌ្ឍនភាពប្រចាំ {selected_week}៖ {pct_w}%** ({d_w} / {t_w} សកម្មភាព)")
+                st.progress(pct_w / 100)
+                st.write("")
+
                 # ចុះវត្តមាន
                 att_key = f"att_{selected_week}"
                 att_done = att_key in completed_keys
@@ -484,7 +554,7 @@ else:
                         conn.commit()
                         st.rerun()
 
-                # បង្ហាញបញ្ជី Learning Materials ទាំងអស់ក្នុងសប្តាហ៍នេះ
+                # បង្ហាញបញ្ជី Learning Materials ទាំងអស់ក្នុងសប្តាហ៍នេះ (អានផ្ទាល់ + Download)
                 render_week_materials(selected_week, is_teacher=False, stu_id=stu_id, completed_keys=completed_keys)
 
                 # វេទិកាពិភាក្សា
@@ -542,7 +612,7 @@ else:
             st.dataframe(df_part, use_container_width=True)
 
         elif top_menu == "📊 ពិន្ទុរបស់ខ្ញុំ":
-            st.subheader(f"📊 លទ្ធផលពិន្ទុរបស់ {stu_name} ({stu_id})")
+            st.subheader(f"📊 លទ្ធផលពិន្ទុ និងវឌ្ឍនភាពរបស់ {stu_name} ({stu_id})")
             df_my_sc = pd.read_sql_query("SELECT week AS វិញ្ញាសា, score AS ពិន្ទុបាន, total AS ពិន្ទុពេញ, date AS កាលបរិច្ឆេទ FROM scores WHERE student_id = ?", conn, params=(stu_id,))
             st.dataframe(df_my_sc, use_container_width=True)
             df_my_pf = pd.read_sql_query("SELECT t.title AS ប្រធានបទផលបត្រ, s.file_name AS ឯកសារបានប្រគល់, s.score AS ពិន្ទុវាយតម្លៃ, s.date AS កាលបរិច្ឆេទ FROM portfolio_submissions s JOIN portfolio_tasks t ON s.task_id = t.id WHERE s.student_id = ?", conn, params=(stu_id,))
@@ -556,9 +626,7 @@ else:
                 with st.expander(f"អាន ឬទាញយក៖ {b_title}"):
                     st.write(b_desc)
                     if b_pdf_data and b_pdf_name:
-                        st.download_button(f"📥 ទាញយក៖ {b_pdf_name}", data=b_pdf_data, file_name=b_pdf_name, key=f"lib_d_{b_id}")
-                        base64_pdf = base64.b64encode(b_pdf_data).decode('utf-8')
-                        st.markdown(f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="500" type="application/pdf"></iframe>', unsafe_allow_html=True)
+                        render_document_viewer(b_pdf_data, b_pdf_name, f"lib_{b_id}")
 
         elif top_menu == "📝 បុរេតេស្ត & តេស្តបញ្ចប់":
             t_type = st.radio("ជ្រើសរើសប្រភេទតេស្ត៖", ["📝 បុរេតេស្ត (Pre-Test)", "🎓 តេស្តបញ្ចប់វគ្គ (Final Test)"], horizontal=True)
@@ -604,7 +672,7 @@ else:
 
         t_tabs = st.tabs([
             "📚 រៀបចំមេរៀនតាមសប្តាហ៍ (Add Material)",
-            "📊 របាយការណ៍ពិន្ទុ & វត្តមាន",
+            "📊 របាយការណ៍ពិន្ទុ វត្តមាន & វឌ្ឍនភាព",
             "🗂️ ពិនិត្យផលបត្រសិស្ស",
             "💬 វេទិកាពិភាក្សា",
             "🏛️ បណ្ណាល័យ & ព័ត៌មានទូទៅ",
@@ -612,17 +680,13 @@ else:
             "👥 គណនីសិស្ស"
         ])
         
-        # --- ផ្ទាំងទី ១៖ ចូលទៅសប្តាហ៍នីមួយៗ ហើយចុចប៊ូតុង Add Learning Material ផ្ទាល់ដូច LMS ស្តង់ដារ ---
         with t_tabs[0]:
             adm_selected_week = st.selectbox("📅 ជ្រើសរើសសប្តាហ៍ដើម្បីរៀបចំ និងបន្ថែមសម្ភារៈសិក្សា៖", WEEKS, key="adm_week_view")
-            
             col_hdr1, col_hdr2 = st.columns([3, 1])
             with col_hdr1:
                 st.subheader(f"📖 សម្ភារៈសិក្សាក្នុង {adm_selected_week}")
             with col_hdr2:
-                # ប៊ូតុង Add Learning Material នៅក្នុងសប្តាហ៍នោះផ្ទាល់!
-                add_popover = st.popover("➕ Add Learning Material", use_container_width=True)
-                with add_popover:
+                with st.popover("➕ Add Learning Material", use_container_width=True):
                     st.markdown(f"### ➕ បន្ថែមសម្ភារៈសិក្សាចូល {adm_selected_week}")
                     mat_type = st.selectbox("ជ្រើសរើសប្រភេទសម្ភារៈ (Material Type)៖", [
                         "ឯកសារអាន (File)",
@@ -633,27 +697,22 @@ else:
                         "កិច្ចការ / ស្វ័យសិក្សា (Task)",
                         "សេចក្តីផ្តើម"
                     ])
-                    mat_title = st.text_input("ចំណងជើងសម្ភារៈសិក្សា៖", placeholder="ឧ. មេរៀនទី ១៖ ឯកសារអាន ឬ វីដេអូបង្រៀន...")
+                    mat_title = st.text_input("ចំណងជើងសម្ភារៈសិក្សា៖")
                     
                     mat_file, mat_vid_url, mat_vid_file, mat_link = None, None, None, None
                     v_q, v_a, v_b, v_c, v_corr = None, None, None, None, None
 
-                    # បង្ហាញប្រអប់បញ្ចូលតាមប្រភេទដែលគ្រូបានជ្រើសរើស
                     if mat_type in ["ឯកសារអាន (File)", "កិច្ចការ / ស្វ័យសិក្សា (Task)", "សេចក្តីផ្តើម"]:
-                        mat_file = st.file_uploader("📎 ទម្លាក់ឯកសារ (PDF, Word, Excel, PowerPoint, រូបភាព)៖", type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg"])
-                    
+                        mat_file = st.file_uploader("📎 ទម្លាក់ឯកសារ (PDF, Word, រូបភាព)៖", type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg"])
                     if mat_type in ["វីដេអូបង្រៀន (Video)", "វីដេអូភ្ជាប់សំណួរ (H5P)"]:
                         vid_source = st.radio("ប្រភពវីដេអូ៖", ["តំណភ្ជាប់ YouTube", "Upload ឯកសារវីដេអូ (MP4)"], horizontal=True)
                         if vid_source == "តំណភ្ជាប់ YouTube":
-                            mat_vid_url = st.text_input("បិទភ្ជាប់ Link វីដេអូ YouTube៖", placeholder="https://www.youtube.com/watch?v=...")
+                            mat_vid_url = st.text_input("បិទភ្ជាប់ Link វីដេអូ YouTube៖")
                         else:
                             mat_vid_file = st.file_uploader("🎬 ជ្រើសរើសឯកសារវីដេអូ (MP4)៖", type=["mp4", "mov"])
-
                     if mat_type == "តំណភ្ជាប់ខាងក្រៅ (Link)":
-                        mat_link = st.text_input("🔗 បិទភ្ជាប់ URL (ឧ. GeoGebra, Quizizz, Google Form)៖", placeholder="https://...")
-
+                        mat_link = st.text_input("🔗 បិទភ្ជាប់ URL៖")
                     if mat_type == "វីដេអូភ្ជាប់សំណួរ (H5P)":
-                        st.markdown("**🎯 បង្កើតសំណួរភ្ជាប់ជាមួយវីដេអូ៖**")
                         v_q = st.text_input("សំណួរបំផុសគំនិត៖")
                         v_a = st.text_input("ជម្រើស ក")
                         v_b = st.text_input("ជម្រើស ខ")
@@ -666,28 +725,37 @@ else:
 
                     if st.button("💾 រក្សាទុក និងបង្ហោះចូលសប្តាហ៍នេះ", type="primary", use_container_width=True):
                         if mat_title:
-                            f_name = mat_file.name if mat_file else None
-                            f_bytes = mat_file.read() if mat_file else None
-                            vf_name = mat_vid_file.name if mat_vid_file else None
-                            vf_bytes = mat_vid_file.read() if mat_vid_file else None
-                            
                             c.execute('''INSERT INTO lessons (week, category, title, content, video_url, pdf_name, pdf_data, v_question, v_opt_a, v_opt_b, v_opt_c, v_correct, ext_link, video_blob, video_filename) 
                                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                                      (adm_selected_week, mat_type, mat_title, mat_desc, mat_vid_url, f_name, f_bytes, v_q, v_a, v_b, v_c, v_corr, mat_link, vf_bytes, vf_name))
+                                      (adm_selected_week, mat_type, mat_title, mat_desc, mat_vid_url, mat_file.name if mat_file else None, mat_file.read() if mat_file else None, v_q, v_a, v_b, v_c, v_corr, mat_link, mat_vid_file.read() if mat_vid_file else None, mat_vid_file.name if mat_vid_file else None))
                             conn.commit()
-                            st.success(f"បានបន្ថែម «{mat_title}» ដោយជោគជ័យ!")
                             st.rerun()
-                        else:
-                            st.error("សូមបញ្ចូលចំណងជើង!")
 
             st.divider()
-            # បង្ហាញសម្ភារៈសិក្សាទាំងអស់ដែលមានក្នុងសប្តាហ៍នេះ ឲ្យគ្រូពិនិត្យ និងអាចចុចលុបបានភ្លាមៗ
             render_week_materials(adm_selected_week, is_teacher=True)
 
-        # --- ផ្ទាំងទី ២៖ របាយការណ៍ពិន្ទុ និងវត្តមាន ---
+        # --- ផ្ទាំងទី ២៖ របាយការណ៍ពិន្ទុ វត្តមាន និងភាគរយវឌ្ឍនភាពសិស្ស ---
         with t_tabs[1]:
             filter_class = st.selectbox("🏫 ជ្រើសរើសថ្នាក់៖", ["ទាំងអស់"] + CLASSES)
-            st.subheader("១. តារាងបូកសរុបពិន្ទុតេស្ត")
+            
+            st.subheader("📈 ១. តារាងតាមដានវឌ្ឍនភាពសិក្សារបស់សិស្ស (Progress %)")
+            if filter_class == "ទាំងអស់":
+                c.execute("SELECT class_name, student_id, full_name FROM users WHERE role = 'student' ORDER BY class_name, student_id")
+            else:
+                c.execute("SELECT class_name, student_id, full_name FROM users WHERE role = 'student' AND class_name = ? ORDER BY student_id", (filter_class,))
+            stu_list = c.fetchall()
+            if stu_list:
+                prog_rows = []
+                for sc_cls, sc_id, sc_nm in stu_list:
+                    d_i, t_i, pct_i = calculate_student_progress(sc_id)
+                    prog_rows.append({"ថ្នាក់": sc_cls, "អត្តលេខ": sc_id, "ឈ្មោះសិស្ស": sc_nm, "សកម្មភាពបានធ្វើ": f"{d_i}/{t_i}", "វឌ្ឍនភាព (%)": f"{pct_i}%"})
+                df_prog = pd.DataFrame(prog_rows)
+                st.dataframe(df_prog, use_container_width=True)
+            else:
+                st.info("មិនទាន់មានសិស្សចុះឈ្មោះនៅឡើយទេ។")
+
+            st.divider()
+            st.subheader("📊 ២. តារាងបូកសរុបពិន្ទុតេស្ត")
             if filter_class == "ទាំងអស់":
                 df_scores = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, student_name AS ឈ្មោះសិស្ស, week AS ប្រភេទតេស្ត, score AS ពិន្ទុបាន, total AS ពិន្ទុពេញ, date AS កាលបរិច្ឆេទ FROM scores", conn)
             else:
@@ -699,11 +767,9 @@ else:
                 pivot_scores['ពិន្ទុសរុបរួម'] = pivot_scores[score_cols].sum(axis=1)
                 st.dataframe(pivot_scores, use_container_width=True)
                 st.download_button(f"📥 ទាញយកតារាងពិន្ទុ ({filter_class})", pivot_scores.to_csv(index=False).encode('utf-8-sig'), f"scores_{filter_class}.csv", "text/csv")
-            else:
-                st.info("មិនទាន់មានទិន្នន័យពិន្ទុទេ។")
 
             st.divider()
-            st.subheader("២. តារាងវត្តមានសិស្ស")
+            st.subheader("✅ ៣. តារាងវត្តមានសិស្ស")
             if filter_class == "ទាំងអស់":
                 df_att = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, student_name AS ឈ្មោះសិស្ស, week AS សប្តាហ៍, status AS ស្ថានភាព, date AS កាលបរិច្ឆេទ FROM attendance", conn)
             else:
@@ -712,7 +778,6 @@ else:
             if not df_att.empty:
                 st.download_button(f"📥 ទាញយកបញ្ជីវត្តមាន ({filter_class})", df_att.to_csv(index=False).encode('utf-8-sig'), f"attendance_{filter_class}.csv", "text/csv")
 
-        # --- ផ្ទាំងទី ៣៖ គ្រប់គ្រង និងពិនិត្យផលបត្រសិស្ស ---
         with t_tabs[2]:
             st.subheader("🗂️ ១. បង្កើតប្រធានបទផលបត្រថ្មី")
             with st.form("new_pf_task"):
@@ -732,7 +797,7 @@ else:
             for sid_sub, t_name, s_cls, s_id_num, s_nm, f_nm, f_bytes, s_note, s_sc, s_dt in c.fetchall():
                 with st.expander(f"📄 [{s_cls}] {s_nm} ({s_id_num}) - {t_name} | ពិន្ទុ៖ {s_sc}"):
                     st.write(f"**ឈ្មោះឯកសារ៖** {f_nm} | **ប្រគល់នៅ៖** {s_dt}")
-                    st.download_button(f"📥 ទាញយកឯកសារ៖ {f_nm}", data=f_bytes, file_name=f_nm, key=f"adm_dl_pf_{sid_sub}")
+                    render_document_viewer(f_bytes, f_nm, f"adm_pf_{sid_sub}")
                     col_g1, col_g2 = st.columns([2, 1])
                     with col_g1: new_grade = st.text_input("ដាក់ពិន្ទុ ឬមតិវាយតម្លៃ៖", value=s_sc, key=f"grd_in_{sid_sub}")
                     with col_g2:
@@ -742,7 +807,6 @@ else:
                             conn.commit()
                             st.rerun()
 
-        # --- ផ្ទាំងទី ៤៖ វេទិកាពិភាក្សា ---
         with t_tabs[3]:
             f_w_adm = st.selectbox("ជ្រើសរើសសប្តាហ៍៖", WEEKS, key="f_w_a")
             with st.form("adm_f_rep"):
@@ -762,13 +826,12 @@ else:
                     conn.commit()
                     st.rerun()
 
-        # --- ផ្ទាំងទី ៥៖ បណ្ណាល័យ & ព័ត៌មានទូទៅ ---
         with t_tabs[4]:
             st.subheader("🏛️ បញ្ចូលឯកសារទៅក្នុងបណ្ណាល័យរួម")
             with st.form("lib_f"):
                 bt = st.text_input("ចំណងជើងឯកសារ")
                 bd = st.text_area("ការពិពណ៌នា")
-                bp = st.file_uploader("ឯកសារ PDF", type=["pdf"])
+                bp = st.file_uploader("ឯកសារ PDF / Word", type=["pdf", "docx"])
                 if st.form_submit_button("បញ្ចូលក្នុងបណ្ណាល័យ"):
                     if bt and bp:
                         c.execute("INSERT INTO library (title, description, pdf_name, pdf_data, date) VALUES (?, ?, ?, ?, ?)", (bt, bd, bp.name, bp.read(), datetime.now().strftime("%Y-%m-%d")))
@@ -791,7 +854,6 @@ else:
                         conn.commit()
                         st.success("បានបង្ហោះដំណឹង!")
 
-        # --- ផ្ទាំងទី ៦៖ ឃ្លាំងសំណួរ & តេស្ត ---
         with t_tabs[5]:
             st.subheader("📤 Upload សំណួរច្រើន (CSV/Excel)")
             sample_df = pd.DataFrame({
@@ -834,7 +896,6 @@ else:
                 conn.commit()
                 st.success("បានរក្សាទុក!")
 
-        # --- ផ្ទាំងទី ៧៖ គ្រប់គ្រងគណនីសិស្ស ---
         with t_tabs[6]:
             st.subheader("👥 បញ្ជីគណនីសិស្សដែលបានចុះឈ្មោះក្នុងប្រព័ន្ធ")
             df_users = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, full_name AS ឈ្មោះសិស្ស, email AS អ៊ីមែល, created_at AS ថ្ងៃចុះឈ្មោះ FROM users WHERE role = 'student'", conn)
