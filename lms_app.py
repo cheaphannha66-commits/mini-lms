@@ -22,9 +22,9 @@ def hash_pass(password):
 # ==========================================
 # ការកំណត់គណនីគ្រូ
 # ==========================================
-TEACHER_EMAIL = "cheaphannha66@gmail.com"
+TEACHER_EMAIL = "teacher@gmail.com"
 TEACHER_PASS_HASH = hash_pass("23101990lkk")
-TEACHER_NAME = "លោកគ្រូ ជា បញ្ញា"
+TEACHER_NAME = "លោកគ្រូ ជា ផាន់ណា"
 
 WEEKS = ["សប្តាហ៍ទី ១", "សប្តាហ៍ទី ២", "សប្តាហ៍ទី ៣", "សប្តាហ៍ទី ៤", "សប្តាហ៍ទី ៥"]
 CLASSES = ["ថ្នាក់ ក", "ថ្នាក់ ខ", "ថ្នាក់ គ"]
