@@ -22,9 +22,9 @@ def hash_pass(password):
 # ==========================================
 # ការកំណត់គណនីគ្រូ
 # ==========================================
-TEACHER_EMAIL = "teacher@gmail.com"
+TEACHER_EMAIL = "cheaphannha66@gmail.com"
 TEACHER_PASS_HASH = hash_pass("23101990lkk")
-TEACHER_NAME = "លោកគ្រូ ជា ផាន់ណា"
+TEACHER_NAME = "លោកគ្រូ ជា បញ្ញា"
 
 WEEKS = ["សប្តាហ៍ទី ១", "សប្តាហ៍ទី ២", "សប្តាហ៍ទី ៣", "សប្តាហ៍ទី ៤", "សប្តាហ៍ទី ៥"]
 CLASSES = ["ថ្នាក់ ក", "ថ្នាក់ ខ", "ថ្នាក់ គ"]
@@ -185,7 +185,6 @@ def render_document_viewer(table_name, row_id, file_col, name_col, file_name, un
     if not file_name:
         return
     
-    # ទាញយកទិន្នន័យឯកសារតែពេលចុចបើក (ជួយឲ្យកម្មវិធីដើរលឿនខ្លាំង)
     c.execute(f"SELECT {file_col} FROM {table_name} WHERE id = ?", (row_id,))
     res = c.fetchone()
     if not res or not res[0]:
@@ -209,34 +208,57 @@ def render_document_viewer(table_name, row_id, file_col, name_col, file_name, un
             if page_state_key not in st.session_state:
                 st.session_state[page_state_key] = 1
 
-            # របារបញ្ជាប្តូរទំព័រ (⬅️ ថយក្រោយ | ទំព័រទី X / Y | ទំព័របន្ទាប់ ➡️)
+            # ការពារកុំឲ្យលេខទំព័រលើស ឬខ្វះ
+            if st.session_state[page_state_key] < 1:
+                st.session_state[page_state_key] = 1
+            if st.session_state[page_state_key] > total_pages:
+                st.session_state[page_state_key] = total_pages
+
+            curr_page = st.session_state[page_state_key]
+
+            # របារប៊ូតុង ⬅️ ថយក្រោយ | ទំព័រទី X / Y | ទៅមុខ ➡️ (គ្មានសញ្ញា - និង + ទៀតទេ)
             st.markdown("---")
-            col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+            col_p1, col_p2, col_p3 = st.columns([1.2, 1.6, 1.2])
             with col_p1:
-                if st.button("⬅️ ទំព័រមុន", key=f"prev_{unique_key}", disabled=(st.session_state[page_state_key] <= 1), use_container_width=True):
+                if st.button("⬅️ ថយក្រោយ", key=f"prev_{unique_key}", disabled=(curr_page <= 1), use_container_width=True):
                     st.session_state[page_state_key] -= 1
                     st.rerun()
             with col_p2:
-                selected_p = st.number_input(
-                    f"ទំព័រទី (សរុប {total_pages} ទំព័រ)៖",
-                    min_value=1,
-                    max_value=total_pages,
-                    value=st.session_state[page_state_key],
-                    key=f"num_{unique_key}"
+                st.markdown(
+                    f"<div style='text-align:center; font-size:17px; font-weight:bold; padding-top:6px; color:#1e3a8a;'>"
+                    f"ទំព័រទី {curr_page} / {total_pages}"
+                    f"</div>",
+                    unsafe_allow_html=True
                 )
-                if selected_p != st.session_state[page_state_key]:
-                    st.session_state[page_state_key] = selected_p
-                    st.rerun()
             with col_p3:
-                if st.button("ទំព័របន្ទាប់ ➡️", key=f"next_{unique_key}", disabled=(st.session_state[page_state_key] >= total_pages), use_container_width=True):
+                if st.button("ទៅមុខ ➡️", key=f"next_{unique_key}", disabled=(curr_page >= total_pages), use_container_width=True):
                     st.session_state[page_state_key] += 1
                     st.rerun()
 
-            # បង្ហាញតែទំព័រដែលកំពុងជ្រើសរើសប៉ុណ្ណោះ
-            curr_idx = st.session_state[page_state_key] - 1
-            page = doc.load_page(curr_idx)
+            # បង្ហាញរូបភាពទំព័រដែលកំពុងអាន
+            page = doc.load_page(curr_page - 1)
             pix = page.get_pixmap(dpi=150)
-            st.image(pix.tobytes("png"), caption=f"ទំព័រទី {curr_idx + 1} នៃ {total_pages}", use_container_width=True)
+            st.image(pix.tobytes("png"), use_container_width=True)
+
+            # បន្ថែមប៊ូតុង ⬅️ ថយក្រោយ និង ទៅមុខ ➡️ នៅខាងក្រោមទំព័រមួយជាន់ទៀត ដើម្បីកុំឲ្យសិស្សពិបាកអូសឡើងលើពេលអានចប់ ១ ទំព័រ
+            if total_pages > 1:
+                col_b1, col_b2, col_b3 = st.columns([1.2, 1.6, 1.2])
+                with col_b1:
+                    if st.button("⬅️ ថយក្រោយ", key=f"prev_bot_{unique_key}", disabled=(curr_page <= 1), use_container_width=True):
+                        st.session_state[page_state_key] -= 1
+                        st.rerun()
+                with col_b2:
+                    st.markdown(
+                        f"<div style='text-align:center; font-size:15px; font-weight:bold; padding-top:6px; color:#4b5563;'>"
+                        f"ទំព័រទី {curr_page} / {total_pages}"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+                with col_b3:
+                    if st.button("ទៅមុខ ➡️", key=f"next_bot_{unique_key}", disabled=(curr_page >= total_pages), use_container_width=True):
+                        st.session_state[page_state_key] += 1
+                        st.rerun()
+
         except Exception as e:
             st.error(f"មិនអាចបើកបង្ហាញទំព័រ PDF ផ្ទាល់បានទេ សូមចុចប៊ូតុងទាញយកខាងលើ។ ({e})")
             
@@ -250,7 +272,6 @@ def render_document_viewer(table_name, row_id, file_col, name_col, file_name, un
             
     elif fname_lower.endswith((".png", ".jpg", ".jpeg")):
         st.image(file_bytes, caption=file_name, use_container_width=True)
-
 # រចនាម៉ូដ CSS
 st.markdown("""
     <style>
