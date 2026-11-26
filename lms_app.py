@@ -2,9 +2,10 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import hashlib
+import secrets
 import io
-import fitz  # PyMuPDF សម្រាប់បង្ហាញទំព័រ PDF លើគ្រប់ Browser និងទូរស័ព្ទ
-import docx  # សម្រាប់បង្ហាញអត្ថបទពីឯកសារ Word (.docx)
+import fitz  # PyMuPDF
+import docx
 from datetime import datetime
 from streamlit_quill import st_quill
 
@@ -32,6 +33,8 @@ CLASSES = ["ថ្នាក់ ក", "ថ្នាក់ ខ", "ថ្នាក�
 def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (email TEXT PRIMARY KEY, password TEXT, role TEXT, class_name TEXT, student_id TEXT, full_name TEXT, created_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions 
+                 (token TEXT PRIMARY KEY, email TEXT, role TEXT, class_name TEXT, student_id TEXT, full_name TEXT, created_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS attendance 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, class_name TEXT, student_id TEXT, student_name TEXT, week TEXT, date TEXT, status TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS lessons 
@@ -115,34 +118,80 @@ def get_setting(key, default_val):
     res = c.fetchone()
     return res[0] if res else default_val
 
-# អនុគមន៍គណនាវឌ្ឍនភាពសិក្សារបស់សិស្ស (Progress Calculation)
+# ==============================================================================
+# ប្រព័ន្ធចងចាំការ Login ដោយស្វ័យប្រវត្តិ (Persistent Session Token ការពារពេល Refresh)
+# ==============================================================================
+def create_persistent_session(user_dict):
+    token = secrets.token_urlsafe(24)
+    c.execute("INSERT INTO sessions (token, email, role, class_name, student_id, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (token, user_dict.get("email"), user_dict.get("role"), user_dict.get("class_name", ""), user_dict.get("student_id", ""), user_dict.get("full_name"), datetime.now().strftime("%Y-%m-%d %H:%M")))
+    conn.commit()
+    st.query_params["session"] = token
+    st.session_state.logged_in = True
+    st.session_state.user_info = user_dict
+
+def restore_session_from_url():
+    if not st.session_state.get("logged_in", False):
+        token = st.query_params.get("session", None)
+        if token:
+            c.execute("SELECT email, role, class_name, student_id, full_name FROM sessions WHERE token = ?", (token,))
+            row = c.fetchone()
+            if row:
+                st.session_state.logged_in = True
+                st.session_state.user_info = {
+                    "email": row[0],
+                    "role": row[1],
+                    "class_name": row[2],
+                    "student_id": row[3],
+                    "full_name": row[4]
+                }
+
+def logout_user():
+    token = st.query_params.get("session", None)
+    if token:
+        c.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        st.query_params.clear()
+    st.session_state.logged_in = False
+    st.session_state.user_info = {}
+    st.rerun()
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.user_info = {}
+
+restore_session_from_url()
+
+# គណនាវឌ្ឍនភាពសិក្សា
 def calculate_student_progress(stu_id, week=None):
     c.execute("SELECT activity_key FROM completions WHERE student_id = ?", (stu_id,))
     done_set = {r[0] for r in c.fetchall()}
-    
     target_weeks = [week] if week else WEEKS
-    total_items = 0
-    done_items = 0
-    
+    total_items, done_items = 0, 0
     for w in target_weeks:
-        # ក្នុង ១ សប្តាហ៍មានសកម្មភាពគោល ៣ (វត្តមាន, វេទិកាពិភាក្សា, តេស្ត) + ចំនួន Learning Materials
         base_keys = [f"att_{w}", f"forum_{w}", f"quiz_{w}"]
         c.execute("SELECT id FROM lessons WHERE week = ? AND category != 'សេចក្តីផ្តើម'", (w,))
         mat_keys = [f"lesson_{r[0]}" for r in c.fetchall()]
-        
         all_w_keys = base_keys + mat_keys
         total_items += len(all_w_keys)
         done_items += sum(1 for k in all_w_keys if k in done_set)
-        
     percent = int((done_items / total_items) * 100) if total_items > 0 else 0
     return done_items, total_items, percent
 
-# អនុគមន៍បង្ហាញឯកសារអានផ្ទាល់លើអេក្រង់ (គាំទ្រ PDF, Word, រូបភាព លើគ្រប់ទូរស័ព្ទ និងកុំព្យូទ័រ)
-def render_document_viewer(file_bytes, file_name, unique_key):
-    if not file_bytes or not file_name:
+# ==============================================================================
+# អនុគមន៍បង្ហាញឯកសារអាន (មានប៊ូតុង ⬅️ ទំព័រមុន / ទំព័របន្ទាប់ ➡️ មិនបង្ហាញវែងចុះក្រោម)
+# ==============================================================================
+def render_document_viewer(table_name, row_id, file_col, name_col, file_name, unique_key):
+    if not file_name:
         return
     
-    # ប៊ូតុងទាញយកឯកសារ (Download)
+    # ទាញយកទិន្នន័យឯកសារតែពេលចុចបើក (ជួយឲ្យកម្មវិធីដើរលឿនខ្លាំង)
+    c.execute(f"SELECT {file_col} FROM {table_name} WHERE id = ?", (row_id,))
+    res = c.fetchone()
+    if not res or not res[0]:
+        return
+    file_bytes = res[0]
+
     st.download_button(
         label=f"📥 ទាញយកឯកសារទុកអាន ({file_name})",
         data=file_bytes,
@@ -152,32 +201,53 @@ def render_document_viewer(file_bytes, file_name, unique_key):
     )
     
     fname_lower = file_name.lower()
-    # ១. បើជាឯកសារ PDF -> បំប្លែងទំព័រនីមួយៗជារូបភាពបង្ហាញផ្ទាល់លើអេក្រង់
     if fname_lower.endswith(".pdf"):
-        with st.expander("📖 ចុចទីនេះដើម្បីបើកអានឯកសារ PDF ផ្ទាល់លើអេក្រង់", expanded=True):
-            try:
-                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                total_pages = len(doc)
-                st.caption(f"ឯកសារនេះមានចំនួន {total_pages} ទំព័រ (អូសចុះក្រោមដើម្បីអានបន្ត)")
-                for page_num in range(total_pages):
-                    page = doc.load_page(page_num)
-                    pix = page.get_pixmap(dpi=150)
-                    img_bytes = pix.tobytes("png")
-                    st.image(img_bytes, caption=f"ទំព័រទី {page_num + 1} / {total_pages}", use_container_width=True)
-            except Exception as e:
-                st.error(f"មិនអាចបើកបង្ហាញទំព័រ PDF ផ្ទាល់បានទេ សូមចុចប៊ូតុងទាញយកខាងលើ។ ({e})")
-                
-    # ២. បើជាឯកសារ Word (.docx) -> បង្ហាញអត្ថបទផ្ទាល់លើអេក្រង់
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_pages = len(doc)
+            page_state_key = f"pdf_page_{unique_key}"
+            if page_state_key not in st.session_state:
+                st.session_state[page_state_key] = 1
+
+            # របារបញ្ជាប្តូរទំព័រ (⬅️ ថយក្រោយ | ទំព័រទី X / Y | ទំព័របន្ទាប់ ➡️)
+            st.markdown("---")
+            col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+            with col_p1:
+                if st.button("⬅️ ទំព័រមុន", key=f"prev_{unique_key}", disabled=(st.session_state[page_state_key] <= 1), use_container_width=True):
+                    st.session_state[page_state_key] -= 1
+                    st.rerun()
+            with col_p2:
+                selected_p = st.number_input(
+                    f"ទំព័រទី (សរុប {total_pages} ទំព័រ)៖",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=st.session_state[page_state_key],
+                    key=f"num_{unique_key}"
+                )
+                if selected_p != st.session_state[page_state_key]:
+                    st.session_state[page_state_key] = selected_p
+                    st.rerun()
+            with col_p3:
+                if st.button("ទំព័របន្ទាប់ ➡️", key=f"next_{unique_key}", disabled=(st.session_state[page_state_key] >= total_pages), use_container_width=True):
+                    st.session_state[page_state_key] += 1
+                    st.rerun()
+
+            # បង្ហាញតែទំព័រដែលកំពុងជ្រើសរើសប៉ុណ្ណោះ
+            curr_idx = st.session_state[page_state_key] - 1
+            page = doc.load_page(curr_idx)
+            pix = page.get_pixmap(dpi=150)
+            st.image(pix.tobytes("png"), caption=f"ទំព័រទី {curr_idx + 1} នៃ {total_pages}", use_container_width=True)
+        except Exception as e:
+            st.error(f"មិនអាចបើកបង្ហាញទំព័រ PDF ផ្ទាល់បានទេ សូមចុចប៊ូតុងទាញយកខាងលើ។ ({e})")
+            
     elif fname_lower.endswith(".docx"):
-        with st.expander("📖 ចុចទីនេះដើម្បីបើកអានឯកសារ Word ផ្ទាល់លើអេក្រង់", expanded=True):
-            try:
-                doc = docx.Document(io.BytesIO(file_bytes))
-                full_text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                st.markdown(full_text)
-            except Exception as e:
-                st.info("សូមចុចប៊ូតុងទាញយកខាងលើដើម្បីបើកឯកសារ Word នេះ។")
-                
-    # ៣. បើជារូបភាព (.png, .jpg, .jpeg) -> បង្ហាញរូបភាពផ្ទាល់
+        try:
+            doc = docx.Document(io.BytesIO(file_bytes))
+            full_text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+            st.markdown(full_text)
+        except Exception:
+            st.info("សូមចុចប៊ូតុងទាញយកខាងលើដើម្បីបើកឯកសារ Word នេះ។")
+            
     elif fname_lower.endswith((".png", ".jpg", ".jpeg")):
         st.image(file_bytes, caption=file_name, use_container_width=True)
 
@@ -194,18 +264,12 @@ st.markdown("""
     header { visibility: hidden; }
     
     .lms-header {
-        background-color: #ffffff;
-        text-align: center;
-        padding: 10px 0 15px 0;
-        border-bottom: 1px solid #e5e7eb;
-        margin-bottom: 15px;
+        background-color: #ffffff; text-align: center; padding: 10px 0 15px 0;
+        border-bottom: 1px solid #e5e7eb; margin-bottom: 15px;
     }
     .lms-main-title {
-        font-size: 32px;
-        font-weight: bold;
-        color: #f59e0b;
-        text-shadow: 1px 1px 0px #1e3a8a;
-        margin: 0;
+        font-size: 32px; font-weight: bold; color: #f59e0b;
+        text-shadow: 1px 1px 0px #1e3a8a; margin: 0;
     }
     .login-card {
         border: 1px solid #dbeafe; border-top: 5px solid #2563eb; border-radius: 12px;
@@ -261,115 +325,140 @@ st.markdown("""
 
 st.markdown('<div class="lms-header"><p class="lms-main-title">📐 ចំណេះដឹងគណិតវិទ្យា 🎓</p></div>', unsafe_allow_html=True)
 
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user_info = {}
-
 # ==============================================================================
-# អនុគមន៍រួម៖ បង្ហាញបញ្ជី Learning Materials ក្នុងសប្តាហ៍នីមួយៗ
+# អនុគមន៍រួម៖ បង្ហាញបញ្ជី Learning Materials (លឿនរហ័ស មានទាំង កែតម្រូវ និង លុប)
 # ==============================================================================
 def render_week_materials(selected_week, is_teacher=False, stu_id="", completed_keys=set()):
-    c.execute("SELECT id, title, content, pdf_name, pdf_data FROM lessons WHERE week = ? AND category = 'សេចក្តីផ្តើម' ORDER BY id ASC", (selected_week,))
-    for i_id, title, content, pdf_name, pdf_data in c.fetchall():
-        col_i1, col_i2 = st.columns([8, 1]) if is_teacher else (st.container(), None)
-        with col_i1:
-            st.markdown(f'<div class="welcome-banner" style="text-align:left; padding:12px 18px;"><h4 style="color:#1d4ed8; margin:0;">📌 {title}</h4></div>', unsafe_allow_html=True)
-            st.markdown(content, unsafe_allow_html=True)
-            if pdf_data and pdf_name:
-                render_document_viewer(pdf_data, pdf_name, f"intro_{i_id}_{is_teacher}")
-        if is_teacher and col_i2:
-            if col_i2.button("🗑️ លុប", key=f"del_intro_{i_id}"):
-                c.execute("DELETE FROM lessons WHERE id = ?", (i_id,))
-                conn.commit()
-                st.rerun()
-
-    c.execute('''SELECT id, category, title, content, video_url, pdf_name, pdf_data, v_question, v_opt_a, v_opt_b, v_opt_c, v_correct, ext_link, video_blob, video_filename 
-                 FROM lessons WHERE week = ? AND category != 'សេចក្តីផ្តើម' ORDER BY id ASC''', (selected_week,))
+    # ទាញយកតែព័ត៌មានអក្សរ (មិនទាញ BLOB ធំៗមុនពេលចុចបើក ដើម្បីឲ្យល្បឿនលឿន)
+    c.execute('''SELECT id, category, title, content, video_url, pdf_name, v_question, v_opt_a, v_opt_b, v_opt_c, v_correct, ext_link, video_filename 
+                 FROM lessons WHERE week = ? ORDER BY id ASC''', (selected_week,))
     materials = c.fetchall()
 
     if not materials:
         st.info(f"មិនទាន់មានសម្ភារៈសិក្សា (Learning Material) នៅក្នុង {selected_week} នៅឡើយទេ។")
 
-    for act_id, cat, title, content, video_url, pdf_name, pdf_data, v_q, v_a, v_b, v_c, v_corr, ext_link, vid_blob, vid_fname in materials:
-        act_key = f"lesson_{act_id}"
-        is_done = act_key in completed_keys
-
-        if cat == "ឯកសារអាន (File)":
-            icon_cls, icon_char, action_label = "icon-pdf", "📄", "ឯកសារអាន (File)"
-        elif cat == "វីដេអូបង្រៀន (Video)":
-            icon_cls, icon_char, action_label = "icon-video", "🎬", "វីដេអូបង្រៀន (Video)"
-        elif cat == "វីដេអូភ្ជាប់សំណួរ (H5P)":
-            icon_cls, icon_char, action_label = "icon-h5p", "H5P", "មេរៀនអន្តរកម្មភ្ជាប់សំណួរ"
-        elif cat == "តំណភ្ជាប់ខាងក្រៅ (Link)":
-            icon_cls, icon_char, action_label = "icon-link", "🔗", "តំណភ្ជាប់សិក្សា (Link)"
-        elif cat == "កិច្ចការ / ស្វ័យសិក្សា (Task)":
-            icon_cls, icon_char, action_label = "icon-task", "📤", "កិច្ចការ / ស្វ័យសិក្សា"
-        else:
-            icon_cls, icon_char, action_label = "icon-page", "📝", "អត្ថបទមេរៀន (Page)"
-
-        if is_teacher:
-            status_html = f'<div class="act-status-pending">ប្រភេទ៖ {action_label}</div>'
-        else:
-            status_html = f'<div class="act-status-done">✓ បានរៀនរួចរាល់ ({action_label})</div>' if is_done else f'<div class="act-status-pending">○ មិនទាន់បានបញ្ចប់ ({action_label})</div>'
-
-        col_m1, col_m2 = st.columns([9, 1]) if is_teacher else (st.container(), None)
-        with col_m1:
-            st.markdown(f'''
-                <div class="activity-row">
-                    <div class="icon-box {icon_cls}">{icon_char}</div>
-                    <div>
-                        <p class="act-title">{title}</p>
-                        {status_html}
-                    </div>
-                </div>
-            ''', unsafe_allow_html=True)
-        if is_teacher and col_m2:
-            st.write("")
-            if col_m2.button("🗑️ លុប", key=f"del_mat_{act_id}"):
-                c.execute("DELETE FROM lessons WHERE id = ?", (act_id,))
-                conn.commit()
-                st.rerun()
-
-        with st.expander(f"បើកអាន / ទស្សនា៖ {title}"):
-            if content:
+    for act_id, cat, title, content, video_url, pdf_name, v_q, v_a, v_b, v_c, v_corr, ext_link, vid_fname in materials:
+        if cat == "សេចក្តីផ្តើម":
+            col_i1, col_i2, col_i3 = st.columns([8, 1, 1]) if is_teacher else (st.container(), None, None)
+            with col_i1:
+                st.markdown(f'<div class="welcome-banner" style="text-align:left; padding:12px 18px;"><h4 style="color:#1d4ed8; margin:0;">📌 {title}</h4></div>', unsafe_allow_html=True)
                 st.markdown(content, unsafe_allow_html=True)
-            
-            # បង្ហាញឯកសារអានផ្ទាល់លើអេក្រង់ + ប៊ូតុង Download
-            if pdf_data and pdf_name:
-                render_document_viewer(pdf_data, pdf_name, f"mat_{act_id}_{is_teacher}")
-            
-            if video_url:
-                st.video(video_url)
-            if vid_blob:
-                st.video(vid_blob)
+                if pdf_name:
+                    render_document_viewer("lessons", act_id, "pdf_data", "pdf_name", pdf_name, f"intro_{act_id}_{is_teacher}")
+            if is_teacher:
+                if col_i2.button("✏️ កែ", key=f"ed_btn_{act_id}"):
+                    st.session_state[f"editing_{act_id}"] = not st.session_state.get(f"editing_{act_id}", False)
+                if col_i3.button("🗑️ លុប", key=f"del_mat_{act_id}"):
+                    c.execute("DELETE FROM lessons WHERE id = ?", (act_id,))
+                    conn.commit()
+                    st.rerun()
+        else:
+            act_key = f"lesson_{act_id}"
+            is_done = act_key in completed_keys
 
-            if ext_link:
-                st.link_button("🌐 ចុចទីនេះដើម្បីបើកតំណភ្ជាប់សិក្សា", ext_link)
+            if cat == "ឯកសារអាន (File)":
+                icon_cls, icon_char, action_label = "icon-pdf", "📄", "ឯកសារអាន (File)"
+            elif cat == "វីដេអូបង្រៀន (Video)":
+                icon_cls, icon_char, action_label = "icon-video", "🎬", "វីដេអូបង្រៀន (Video)"
+            elif cat == "វីដេអូភ្ជាប់សំណួរ (H5P)":
+                icon_cls, icon_char, action_label = "icon-h5p", "H5P", "មេរៀនអន្តរកម្មភ្ជាប់សំណួរ"
+            elif cat == "តំណភ្ជាប់ខាងក្រៅ (Link)":
+                icon_cls, icon_char, action_label = "icon-link", "🔗", "តំណភ្ជាប់សិក្សា (Link)"
+            elif cat == "កិច្ចការ / ស្វ័យសិក្សា (Task)":
+                icon_cls, icon_char, action_label = "icon-task", "📤", "កិច្ចការ / ស្វ័យសិក្សា"
+            else:
+                icon_cls, icon_char, action_label = "icon-page", "📝", "អត្ថបទមេរៀន (Page)"
 
-            if v_q and v_a and v_b and v_c:
-                st.markdown("---")
-                st.markdown(f"**🎬 សំណួរបំផុសគំនិត៖** {v_q}")
-                ans_choice = st.radio("ជ្រើសរើសចម្លើយ៖", [v_a, v_b, v_c], key=f"vq_r_{act_id}_{is_teacher}")
-                if st.button("ផ្ទៀងផ្ទាត់ចម្លើយ", key=f"vq_c_{act_id}_{is_teacher}"):
-                    if ans_choice == v_corr:
-                        st.success("🎉 ត្រឹមត្រូវ!")
-                        if not is_teacher and stu_id and not is_done:
+            status_html = f'<div class="act-status-pending">ប្រភេទ៖ {action_label}</div>' if is_teacher else (
+                f'<div class="act-status-done">✓ បានរៀនរួចរាល់ ({action_label})</div>' if is_done else f'<div class="act-status-pending">○ មិនទាន់បានបញ្ចប់ ({action_label})</div>'
+            )
+
+            col_m1, col_m2, col_m3 = st.columns([8, 1, 1]) if is_teacher else (st.container(), None, None)
+            with col_m1:
+                st.markdown(f'''
+                    <div class="activity-row">
+                        <div class="icon-box {icon_cls}">{icon_char}</div>
+                        <div>
+                            <p class="act-title">{title}</p>
+                            {status_html}
+                        </div>
+                    </div>
+                ''', unsafe_allow_html=True)
+            if is_teacher:
+                st.write("")
+                if col_m2.button("✏️ កែ", key=f"ed_btn_{act_id}", help="កែតម្រូវមេរៀននេះ"):
+                    st.session_state[f"editing_{act_id}"] = not st.session_state.get(f"editing_{act_id}", False)
+                if col_m3.button("🗑️ លុប", key=f"del_mat_{act_id}", help="លុបមេរៀននេះ"):
+                    c.execute("DELETE FROM lessons WHERE id = ?", (act_id,))
+                    conn.commit()
+                    st.rerun()
+
+            with st.expander(f"បើកអាន / ទស្សនា៖ {title}"):
+                if content:
+                    st.markdown(content, unsafe_allow_html=True)
+                if pdf_name:
+                    render_document_viewer("lessons", act_id, "pdf_data", "pdf_name", pdf_name, f"mat_{act_id}_{is_teacher}")
+                if video_url:
+                    st.video(video_url)
+                if vid_fname:
+                    c.execute("SELECT video_blob FROM lessons WHERE id = ?", (act_id,))
+                    vb = c.fetchone()
+                    if vb and vb[0]:
+                        st.video(vb[0])
+                if ext_link:
+                    st.link_button("🌐 ចុចទីនេះដើម្បីបើកតំណភ្ជាប់សិក្សា", ext_link)
+
+                if v_q and v_a and v_b and v_c:
+                    st.markdown("---")
+                    st.markdown(f"**🎬 សំណួរបំផុសគំនិត៖** {v_q}")
+                    ans_choice = st.radio("ជ្រើសរើសចម្លើយ៖", [v_a, v_b, v_c], key=f"vq_r_{act_id}_{is_teacher}")
+                    if st.button("ផ្ទៀងផ្ទាត់ចម្លើយ", key=f"vq_c_{act_id}_{is_teacher}"):
+                        if ans_choice == v_corr:
+                            st.success("🎉 ត្រឹមត្រូវ!")
+                            if not is_teacher and stu_id and not is_done:
+                                c.execute("INSERT INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (stu_id, act_key, datetime.now().strftime("%Y-%m-%d %H:%M")))
+                                conn.commit()
+                                st.rerun()
+                        else:
+                            st.error(f"❌ មិនទាន់ត្រូវទេ! ចម្លើយត្រូវគឺ៖ {v_corr}")
+
+                if not is_teacher:
+                    st.markdown("---")
+                    if not is_done:
+                        if st.button("✅ គូសចំណាំថាបានអាន/រៀនមេរៀននេះរួចរាល់", key=f"dn_b_{act_id}", type="primary"):
                             c.execute("INSERT INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (stu_id, act_key, datetime.now().strftime("%Y-%m-%d %H:%M")))
                             conn.commit()
                             st.rerun()
                     else:
-                        st.error(f"❌ មិនទាន់ត្រូវទេ! ចម្លើយត្រូវគឺ៖ {v_corr}")
+                        st.success("✓ អ្នកបានបញ្ចប់មេរៀននេះរួចរាល់ហើយ!")
 
-            # ប៊ូតុងគូសចំណាំថារៀនរួចរាល់ ដើម្បីដំឡើងភាគរយវឌ្ឍនភាព
-            if not is_teacher:
-                st.markdown("---")
-                if not is_done:
-                    if st.button("✅ គូសចំណាំថាបានអាន/រៀនមេរៀននេះរួចរាល់ (បង្កើនវឌ្ឍនភាព)", key=f"dn_b_{act_id}", type="primary"):
-                        c.execute("INSERT INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (stu_id, act_key, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        # ផ្ទាំងកែតម្រូវ (Edit Form) សម្រាប់គ្រូនៅពេលចុចប៊ូតុង ✏️ កែ
+        if is_teacher and st.session_state.get(f"editing_{act_id}", False):
+            with st.container(border=True):
+                st.markdown(f"#### ✏️ កែតម្រូវ៖ {title}")
+                new_title = st.text_input("ចំណងជើងថ្មី៖", value=title, key=f"ed_t_{act_id}")
+                new_content = st.text_area("សេចក្តីពណ៌នា / ខ្លឹមសារ៖", value=content or "", key=f"ed_c_{act_id}")
+                new_vid_url = st.text_input("តំណភ្ជាប់ YouTube (បើមាន)៖", value=video_url or "", key=f"ed_v_{act_id}")
+                new_ext_link = st.text_input("តំណភ្ជាប់ខាងក្រៅ (បើមាន)៖", value=ext_link or "", key=f"ed_l_{act_id}")
+                new_file = st.file_uploader("ប្តូរឯកសារថ្មី (ទុកទទេបើរក្សាឯកសារចាស់)៖", type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg"], key=f"ed_f_{act_id}")
+                
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    if st.button("💾 រក្សាទុកការកែប្រែ", key=f"save_ed_{act_id}", type="primary"):
+                        if new_file:
+                            c.execute("UPDATE lessons SET title=?, content=?, video_url=?, ext_link=?, pdf_name=?, pdf_data=? WHERE id=?",
+                                      (new_title, new_content, new_vid_url, new_ext_link, new_file.name, new_file.read(), act_id))
+                        else:
+                            c.execute("UPDATE lessons SET title=?, content=?, video_url=?, ext_link=? WHERE id=?",
+                                      (new_title, new_content, new_vid_url, new_ext_link, act_id))
                         conn.commit()
+                        st.session_state[f"editing_{act_id}"] = False
+                        st.success("បានរក្សាទុកការកែតម្រូវ!")
                         st.rerun()
-                else:
-                    st.success("✓ អ្នកបានបញ្ចប់មេរៀននេះរួចរាល់ហើយ!")
+                with col_s2:
+                    if st.button("❌ បោះបង់", key=f"cancel_ed_{act_id}"):
+                        st.session_state[f"editing_{act_id}"] = False
+                        st.rerun()
 
 
 # ==============================================================================
@@ -380,7 +469,7 @@ if not st.session_state.logged_in:
     with col_center:
         st.markdown('<div class="login-card">', unsafe_allow_html=True)
         st.subheader("🔐 ចូលប្រើប្រាស់ប្រព័ន្ធសិក្សាអនឡាញ (Sign In)")
-        st.caption("សូមជ្រើសរើសតួនាទី និងបញ្ចូល Email របស់អ្នកដើម្បីចូលទៅកាន់ថ្នាក់រៀន")
+        st.caption("ប្រព័ន្ធនឹងចងចាំគណនីរបស់អ្នកដោយស្វ័យប្រវត្តិ (មិនបាច់វាយម្តងទៀតពេល Refresh ទំព័រ)")
 
         auth_mode = st.tabs(["🔑 ចូលប្រើប្រាស់ (Sign In)", "📝 ចុះឈ្មោះសិស្សថ្មី (Register)"])
 
@@ -392,8 +481,7 @@ if not st.session_state.logged_in:
             if st.button("🚀 ចូលប្រើប្រាស់ (Sign In)", use_container_width=True, type="primary"):
                 if login_role == "👨‍🏫 គ្រូបង្រៀន (Teacher)":
                     if email_in == TEACHER_EMAIL.lower() and hash_pass(pass_in) == TEACHER_PASS_HASH:
-                        st.session_state.logged_in = True
-                        st.session_state.user_info = {"role": "teacher", "email": TEACHER_EMAIL, "full_name": TEACHER_NAME}
+                        create_persistent_session({"role": "teacher", "email": TEACHER_EMAIL, "full_name": TEACHER_NAME})
                         st.rerun()
                     else:
                         st.error("❌ Email ឬ លេខសម្ងាត់គ្រូមិនត្រឹមត្រូវទេ!")
@@ -401,8 +489,7 @@ if not st.session_state.logged_in:
                     c.execute("SELECT email, role, class_name, student_id, full_name FROM users WHERE email = ? AND password = ?", (email_in, hash_pass(pass_in)))
                     user_row = c.fetchone()
                     if user_row:
-                        st.session_state.logged_in = True
-                        st.session_state.user_info = {"role": "student", "email": user_row[0], "class_name": user_row[2], "student_id": user_row[3], "full_name": user_row[4]}
+                        create_persistent_session({"role": "student", "email": user_row[0], "class_name": user_row[2], "student_id": user_row[3], "full_name": user_row[4]})
                         st.rerun()
                     else:
                         st.error("❌ Email ឬ លេខសម្ងាត់សិស្សមិនត្រឹមត្រូវ ឬមិនទាន់បានចុះឈ្មោះ!")
@@ -429,8 +516,7 @@ if not st.session_state.logged_in:
                                 c.execute("INSERT INTO users (email, password, role, class_name, student_id, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                           (reg_email, hash_pass(reg_pass), "student", reg_class, reg_sid, reg_name, now_str))
                                 conn.commit()
-                                st.session_state.logged_in = True
-                                st.session_state.user_info = {"role": "student", "email": reg_email, "class_name": reg_class, "student_id": reg_sid, "full_name": reg_name}
+                                create_persistent_session({"role": "student", "email": reg_email, "class_name": reg_class, "student_id": reg_sid, "full_name": reg_name})
                                 st.rerun()
                     else:
                         st.error("សូមបំពេញព័ត៌មានទាំងអស់ឲ្យបានគ្រប់គ្រាន់!")
@@ -448,16 +534,13 @@ else:
             st.success(f"**តួនាទី៖ គ្រូបង្រៀន**\n\nឈ្មោះ៖ {user['full_name']}\n\nEmail៖ {user['email']}")
         else:
             st.info(f"**តួនាទី៖ សិស្ស**\n\nឈ្មោះ៖ {user['full_name']}\n\nអត្តលេខ៖ {user['student_id']} ({user['class_name']})\n\nEmail៖ {user['email']}")
-            # បង្ហាញវឌ្ឍនភាពសរុបនៅរបារខាងឆ្វេងផងដែរ
             d_all, t_all, pct_all = calculate_student_progress(user["student_id"])
             st.markdown(f"**📈 វឌ្ឍនភាពសិក្សាសរុប៖ {pct_all}%**")
             st.progress(pct_all / 100)
             st.caption(f"បានបំពេញ {d_all} លើ {t_all} សកម្មភាព")
 
         if st.button("🚪 ចាកចេញ (Sign Out)", use_container_width=True):
-            st.session_state.logged_in = False
-            st.session_state.user_info = {}
-            st.rerun()
+            logout_user()
 
     # ==========================================
     # ១. ផ្នែកសម្រាប់សិស្ស (STUDENT PORTAL)
@@ -470,11 +553,8 @@ else:
             st.markdown(f"👋 សូមស្វាគមន៍៖ **{stu_name}** | អត្តលេខ៖ **{stu_id}** | **{stu_class}**")
         with col_top2:
             if st.button("🚪 ចាកចេញ", key="top_logout_stu"):
-                st.session_state.logged_in = False
-                st.session_state.user_info = {}
-                st.rerun()
+                logout_user()
 
-        # បង្ហាញផ្ទាំងវឌ្ឍនភាពសិក្សាសរុប (Overall Progress Bar) នៅផ្នែកខាងលើ
         d_all, t_all, pct_all = calculate_student_progress(stu_id)
         st.markdown(f'''
             <div class="progress-card">
@@ -483,12 +563,13 @@ else:
         ''', unsafe_allow_html=True)
         st.progress(pct_all / 100)
 
-        top_menu = st.radio("ម៉ឺនុយ៖", ["📘 វគ្គសិក្សា", "👥 អ្នកចូលរួម", "📊 ពិន្ទុរបស់ខ្ញុំ", "🏛️ បណ្ណាល័យ", "📝 បុរេតេស្ត & តេស្តបញ្ចប់"], horizontal=True, label_visibility="collapsed")
+        top_menu = st.radio("ម៉ឺនុយ៖", ["📘 វគ្គសិក្សា", "✅ ចុះវត្តមាន", "👥 អ្នកចូលរួម", "📊 ពិន្ទុរបស់ខ្ញុំ", "🏛️ បណ្ណាល័យ", "📝 បុរេតេស្ត & តេស្តបញ្ចប់"], horizontal=True, label_visibility="collapsed")
         st.markdown("<hr style='margin-top: 5px; margin-bottom: 15px;'>", unsafe_allow_html=True)
 
         c.execute("SELECT activity_key FROM completions WHERE student_id = ?", (stu_id,))
         completed_keys = {row[0] for row in c.fetchall()}
 
+        # --- ម៉ឺនុយទី ១៖ វគ្គសិក្សា ---
         if top_menu == "📘 វគ្គសិក្សា":
             col_btn1, col_btn2, col_btn3, col_btn4 = st.columns([1, 2, 2, 1])
             with col_btn2:
@@ -534,7 +615,6 @@ else:
             with st.expander("⌄ មេរៀន និងសកម្មភាពសិក្សាប្រចាំសប្តាហ៍ (សប្តាហ៍ទី ១ - ៥) 📚", expanded=True):
                 selected_week = st.selectbox("🔽 ជ្រើសរើសសប្តាហ៍សិក្សា៖", WEEKS)
                 
-                # បង្ហាញវឌ្ឍនភាពប្រចាំសប្តាហ៍នេះ
                 d_w, t_w, pct_w = calculate_student_progress(stu_id, selected_week)
                 st.write(f"**📈 វឌ្ឍនភាពប្រចាំ {selected_week}៖ {pct_w}%** ({d_w} / {t_w} សកម្មភាព)")
                 st.progress(pct_w / 100)
@@ -554,7 +634,6 @@ else:
                         conn.commit()
                         st.rerun()
 
-                # បង្ហាញបញ្ជី Learning Materials ទាំងអស់ក្នុងសប្តាហ៍នេះ (អានផ្ទាល់ + Download)
                 render_week_materials(selected_week, is_teacher=False, stu_id=stu_id, completed_keys=completed_keys)
 
                 # វេទិកាពិភាក្សា
@@ -606,6 +685,27 @@ else:
                             del st.session_state[state_key]
                             st.rerun()
 
+        # --- ម៉ឺនុយទី ២៖ ចុះវត្តមានរហ័ស & ប្រវត្តិវត្តមាន ---
+        elif top_menu == "✅ ចុះវត្តមាន":
+            st.subheader("✅ ចុះវត្តមានសិក្សាប្រចាំសប្តាហ៍")
+            with st.form("quick_att_form"):
+                att_w = st.selectbox("ជ្រើសរើសសប្តាហ៍៖", WEEKS)
+                att_st = st.selectbox("ស្ថានភាព៖", ["វត្តមាន", "សុំច្បាប់"])
+                if st.form_submit_button("✅ បញ្ជូនវត្តមានឥឡូវនេះ", type="primary"):
+                    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    c.execute("INSERT INTO attendance (class_name, student_id, student_name, week, date, status) VALUES (?, ?, ?, ?, ?, ?)",
+                              (stu_class, stu_id, stu_name, att_w, today, att_st))
+                    att_k = f"att_{att_w}"
+                    if att_k not in completed_keys:
+                        c.execute("INSERT INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (stu_id, att_k, today))
+                    conn.commit()
+                    st.success(f"បានកត់ត្រាវត្តមានសម្រាប់ {att_w} ដោយជោគជ័យ!")
+                    st.rerun()
+
+            st.subheader("📋 ប្រវត្តិវត្តមានរបស់ខ្ញុំ")
+            df_my_att = pd.read_sql_query("SELECT week AS សប្តាហ៍, status AS ស្ថានភាព, date AS កាលបរិច្ឆេទ FROM attendance WHERE student_id = ? ORDER BY id DESC", conn, params=(stu_id,))
+            st.dataframe(df_my_att, use_container_width=True)
+
         elif top_menu == "👥 អ្នកចូលរួម":
             st.subheader("👥 បញ្ជីឈ្មោះសិស្សដែលបានចុះឈ្មោះចូលរៀន")
             df_part = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, full_name AS ឈ្មោះសិស្ស, email AS អ៊ីមែល FROM users WHERE role = 'student' ORDER BY class_name, student_id", conn)
@@ -620,13 +720,13 @@ else:
 
         elif top_menu == "🏛️ បណ្ណាល័យ":
             st.subheader("🏛️ បណ្ណាល័យឯកសារជំនួយការសិក្សា")
-            c.execute("SELECT id, title, description, pdf_name, pdf_data, date FROM library ORDER BY id DESC")
-            for b_id, b_title, b_desc, b_pdf_name, b_pdf_data, b_date in c.fetchall():
+            c.execute("SELECT id, title, description, pdf_name, date FROM library ORDER BY id DESC")
+            for b_id, b_title, b_desc, b_pdf_name, b_date in c.fetchall():
                 st.markdown(f'<div class="activity-row"><div class="icon-box icon-pdf">📕</div><div><p class="act-title">{b_title}</p><div class="act-status-pending">បង្ហោះថ្ងៃទី៖ {b_date}</div></div></div>', unsafe_allow_html=True)
                 with st.expander(f"អាន ឬទាញយក៖ {b_title}"):
                     st.write(b_desc)
-                    if b_pdf_data and b_pdf_name:
-                        render_document_viewer(b_pdf_data, b_pdf_name, f"lib_{b_id}")
+                    if b_pdf_name:
+                        render_document_viewer("library", b_id, "pdf_data", "pdf_name", b_pdf_name, f"lib_{b_id}")
 
         elif top_menu == "📝 បុរេតេស្ត & តេស្តបញ្ចប់":
             t_type = st.radio("ជ្រើសរើសប្រភេទតេស្ត៖", ["📝 បុរេតេស្ត (Pre-Test)", "🎓 តេស្តបញ្ចប់វគ្គ (Final Test)"], horizontal=True)
@@ -666,13 +766,12 @@ else:
             st.markdown(f"👨‍🏫 គណនីគ្រប់គ្រង៖ **{user['full_name']}** (`{user['email']}`)")
         with col_t2:
             if st.button("🚪 ចាកចេញ", key="top_logout_tch"):
-                st.session_state.logged_in = False
-                st.session_state.user_info = {}
-                st.rerun()
+                logout_user()
 
         t_tabs = st.tabs([
-            "📚 រៀបចំមេរៀនតាមសប្តាហ៍ (Add Material)",
-            "📊 របាយការណ៍ពិន្ទុ វត្តមាន & វឌ្ឍនភាព",
+            "📚 រៀបចំមេរៀន (Add/Edit Material)",
+            "✅ គ្រប់គ្រងវត្តមាន",
+            "📊 របាយការណ៍ពិន្ទុ & វឌ្ឍនភាព",
             "🗂️ ពិនិត្យផលបត្រសិស្ស",
             "💬 វេទិកាពិភាក្សា",
             "🏛️ បណ្ណាល័យ & ព័ត៌មានទូទៅ",
@@ -681,7 +780,7 @@ else:
         ])
         
         with t_tabs[0]:
-            adm_selected_week = st.selectbox("📅 ជ្រើសរើសសប្តាហ៍ដើម្បីរៀបចំ និងបន្ថែមសម្ភារៈសិក្សា៖", WEEKS, key="adm_week_view")
+            adm_selected_week = st.selectbox("📅 ជ្រើសរើសសប្តាហ៍ដើម្បីរៀបចំសម្ភារៈសិក្សា៖", WEEKS, key="adm_week_view")
             col_hdr1, col_hdr2 = st.columns([3, 1])
             with col_hdr1:
                 st.subheader(f"📖 សម្ភារៈសិក្សាក្នុង {adm_selected_week}")
@@ -734,10 +833,46 @@ else:
             st.divider()
             render_week_materials(adm_selected_week, is_teacher=True)
 
-        # --- ផ្ទាំងទី ២៖ របាយការណ៍ពិន្ទុ វត្តមាន និងភាគរយវឌ្ឍនភាពសិស្ស ---
+        # --- ផ្ទាំងទី ២៖ គ្រប់គ្រងវត្តមាន (គ្រូស្រង់វត្តមានផ្ទាល់ + ពិនិត្យបញ្ជីវត្តមាន) ---
         with t_tabs[1]:
+            st.subheader("✅ ១. ស្រង់វត្តមានសិស្សដោយផ្ទាល់ (Teacher Attendance Check)")
+            col_at1, col_at2 = st.columns(2)
+            with col_at1:
+                chk_class = st.selectbox("ជ្រើសរើសថ្នាក់៖", CLASSES, key="tch_att_cls")
+            with col_at2:
+                chk_week = st.selectbox("ជ្រើសរើសសប្តាហ៍៖", WEEKS, key="tch_att_wk")
+
+            c.execute("SELECT student_id, full_name FROM users WHERE role = 'student' AND class_name = ? ORDER BY student_id", (chk_class,))
+            class_students = c.fetchall()
+            if not class_students:
+                st.info(f"មិនទាន់មានសិស្សចុះឈ្មោះក្នុង {chk_class} នៅឡើយទេ។")
+            else:
+                with st.form("tch_bulk_att"):
+                    att_records = {}
+                    for s_id_item, s_nm_item in class_students:
+                        c1, c2 = st.columns([3, 2])
+                        c1.write(f"**{s_id_item}** - {s_nm_item}")
+                        att_records[s_id_item] = (s_nm_item, c2.selectbox("ស្ថានភាព", ["វត្តមាន", "អវត្តមាន", "សុំច្បាប់"], key=f"ta_{chk_week}_{s_id_item}", label_visibility="collapsed"))
+                    if st.form_submit_button("💾 រក្សាទុកវត្តមានទាំងអស់", type="primary"):
+                        today = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        for sid_k, (snm_v, st_val) in att_records.items():
+                            c.execute("INSERT INTO attendance (class_name, student_id, student_name, week, date, status) VALUES (?, ?, ?, ?, ?, ?)",
+                                      (chk_class, sid_k, snm_v, chk_week, today, st_val))
+                            if st_val == "វត្តមាន":
+                                c.execute("INSERT OR IGNORE INTO completions (student_id, activity_key, date) VALUES (?, ?, ?)", (sid_k, f"att_{chk_week}", today))
+                        conn.commit()
+                        st.success("បានរក្សាទុកវត្តមានសិស្សរួចរាល់!")
+
+            st.divider()
+            st.subheader("📋 ២. តារាងវត្តមានសិស្សសរុប")
+            df_att = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, student_name AS ឈ្មោះសិស្ស, week AS សប្តាហ៍, status AS ស្ថានភាព, date AS កាលបរិច្ឆេទ FROM attendance ORDER BY id DESC", conn)
+            st.dataframe(df_att, use_container_width=True)
+            if not df_att.empty:
+                st.download_button("📥 ទាញយកបញ្ជីវត្តមាន (Excel/CSV)", df_att.to_csv(index=False).encode('utf-8-sig'), "student_attendance.csv", "text/csv")
+
+        # --- ផ្ទាំងទី ៣៖ របាយការណ៍ពិន្ទុ និងវឌ្ឍនភាព ---
+        with t_tabs[2]:
             filter_class = st.selectbox("🏫 ជ្រើសរើសថ្នាក់៖", ["ទាំងអស់"] + CLASSES)
-            
             st.subheader("📈 ១. តារាងតាមដានវឌ្ឍនភាពសិក្សារបស់សិស្ស (Progress %)")
             if filter_class == "ទាំងអស់":
                 c.execute("SELECT class_name, student_id, full_name FROM users WHERE role = 'student' ORDER BY class_name, student_id")
@@ -749,10 +884,7 @@ else:
                 for sc_cls, sc_id, sc_nm in stu_list:
                     d_i, t_i, pct_i = calculate_student_progress(sc_id)
                     prog_rows.append({"ថ្នាក់": sc_cls, "អត្តលេខ": sc_id, "ឈ្មោះសិស្ស": sc_nm, "សកម្មភាពបានធ្វើ": f"{d_i}/{t_i}", "វឌ្ឍនភាព (%)": f"{pct_i}%"})
-                df_prog = pd.DataFrame(prog_rows)
-                st.dataframe(df_prog, use_container_width=True)
-            else:
-                st.info("មិនទាន់មានសិស្សចុះឈ្មោះនៅឡើយទេ។")
+                st.dataframe(pd.DataFrame(prog_rows), use_container_width=True)
 
             st.divider()
             st.subheader("📊 ២. តារាងបូកសរុបពិន្ទុតេស្ត")
@@ -768,17 +900,8 @@ else:
                 st.dataframe(pivot_scores, use_container_width=True)
                 st.download_button(f"📥 ទាញយកតារាងពិន្ទុ ({filter_class})", pivot_scores.to_csv(index=False).encode('utf-8-sig'), f"scores_{filter_class}.csv", "text/csv")
 
-            st.divider()
-            st.subheader("✅ ៣. តារាងវត្តមានសិស្ស")
-            if filter_class == "ទាំងអស់":
-                df_att = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, student_name AS ឈ្មោះសិស្ស, week AS សប្តាហ៍, status AS ស្ថានភាព, date AS កាលបរិច្ឆេទ FROM attendance", conn)
-            else:
-                df_att = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, student_name AS ឈ្មោះសិស្ស, week AS សប្តាហ៍, status AS ស្ថានភាព, date AS កាលបរិច្ឆេទ FROM attendance WHERE class_name = ?", conn, params=(filter_class,))
-            st.dataframe(df_att, use_container_width=True)
-            if not df_att.empty:
-                st.download_button(f"📥 ទាញយកបញ្ជីវត្តមាន ({filter_class})", df_att.to_csv(index=False).encode('utf-8-sig'), f"attendance_{filter_class}.csv", "text/csv")
-
-        with t_tabs[2]:
+        # --- ផ្ទាំងទី ៤៖ ពិនិត្យផលបត្រសិស្ស ---
+        with t_tabs[3]:
             st.subheader("🗂️ ១. បង្កើតប្រធានបទផលបត្រថ្មី")
             with st.form("new_pf_task"):
                 pt_title = st.text_input("ចំណងជើងផលបត្រ")
@@ -792,12 +915,12 @@ else:
 
             st.divider()
             st.subheader("📥 ២. ពិនិត្យ ទាញយក និងដាក់ពិន្ទុផលបត្រសិស្ស")
-            c.execute('''SELECT s.id, t.title, s.class_name, s.student_id, s.student_name, s.file_name, s.file_data, s.note, s.score, s.date 
+            c.execute('''SELECT s.id, t.title, s.class_name, s.student_id, s.student_name, s.file_name, s.note, s.score, s.date 
                          FROM portfolio_submissions s JOIN portfolio_tasks t ON s.task_id = t.id ORDER BY s.id DESC''')
-            for sid_sub, t_name, s_cls, s_id_num, s_nm, f_nm, f_bytes, s_note, s_sc, s_dt in c.fetchall():
+            for sid_sub, t_name, s_cls, s_id_num, s_nm, f_nm, s_note, s_sc, s_dt in c.fetchall():
                 with st.expander(f"📄 [{s_cls}] {s_nm} ({s_id_num}) - {t_name} | ពិន្ទុ៖ {s_sc}"):
                     st.write(f"**ឈ្មោះឯកសារ៖** {f_nm} | **ប្រគល់នៅ៖** {s_dt}")
-                    render_document_viewer(f_bytes, f_nm, f"adm_pf_{sid_sub}")
+                    render_document_viewer("portfolio_submissions", sid_sub, "file_data", "file_name", f_nm, f"adm_pf_{sid_sub}")
                     col_g1, col_g2 = st.columns([2, 1])
                     with col_g1: new_grade = st.text_input("ដាក់ពិន្ទុ ឬមតិវាយតម្លៃ៖", value=s_sc, key=f"grd_in_{sid_sub}")
                     with col_g2:
@@ -807,7 +930,8 @@ else:
                             conn.commit()
                             st.rerun()
 
-        with t_tabs[3]:
+        # --- ផ្ទាំងទី ៥៖ វេទិកាពិភាក្សា ---
+        with t_tabs[4]:
             f_w_adm = st.selectbox("ជ្រើសរើសសប្តាហ៍៖", WEEKS, key="f_w_a")
             with st.form("adm_f_rep"):
                 rep = st.text_area("ឆ្លើយតបសិស្ស...")
@@ -826,7 +950,8 @@ else:
                     conn.commit()
                     st.rerun()
 
-        with t_tabs[4]:
+        # --- ផ្ទាំងទី ៦៖ បណ្ណាល័យ & ព័ត៌មានទូទៅ ---
+        with t_tabs[5]:
             st.subheader("🏛️ បញ្ចូលឯកសារទៅក្នុងបណ្ណាល័យរួម")
             with st.form("lib_f"):
                 bt = st.text_input("ចំណងជើងឯកសារ")
@@ -854,7 +979,8 @@ else:
                         conn.commit()
                         st.success("បានបង្ហោះដំណឹង!")
 
-        with t_tabs[5]:
+        # --- ផ្ទាំងទី ៧៖ ឃ្លាំងសំណួរ & តេស្ត ---
+        with t_tabs[6]:
             st.subheader("📤 Upload សំណួរច្រើន (CSV/Excel)")
             sample_df = pd.DataFrame({
                 "week": ["សប្តាហ៍ទី ១", "សប្តាហ៍ទី ២"],
@@ -896,7 +1022,8 @@ else:
                 conn.commit()
                 st.success("បានរក្សាទុក!")
 
-        with t_tabs[6]:
+        # --- ផ្ទាំងទី ៨៖ គ្រប់គ្រងគណនីសិស្ស ---
+        with t_tabs[7]:
             st.subheader("👥 បញ្ជីគណនីសិស្សដែលបានចុះឈ្មោះក្នុងប្រព័ន្ធ")
             df_users = pd.read_sql_query("SELECT class_name AS ថ្នាក់, student_id AS អត្តលេខ, full_name AS ឈ្មោះសិស្ស, email AS អ៊ីមែល, created_at AS ថ្ងៃចុះឈ្មោះ FROM users WHERE role = 'student'", conn)
             st.dataframe(df_users, use_container_width=True)
